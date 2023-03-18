@@ -46,6 +46,7 @@
   "dependencies": {
     "async-eventemitter": "^0.2.4",
     "dcmjs": "^0.38.1",
+    "memorystream": "^0.3.1",
     "smart-buffer": "^4.2.0",
     "ts-mixer": "^6.0.4",
     "winston": "^3.17.0"
