@@ -32,6 +32,9 @@ const log = require('./../src/log');
 
 const http = require('http');
 const selfSigned = require('selfsigned');
+const crypto = require('crypto');
+const fs = require('fs');
+const mockFs = require('mock-fs');
 const chai = require('chai');
 const expect = chai.expect;
 
@@ -47,6 +50,9 @@ const datasets = [
     StudyInstanceUID: Dataset.generateDerivedUid(),
   }),
 ];
+
+const StreamingTempFile = 'streaming.tmp';
+const StreamingPart10File = 'part10.tmp';
 
 class RejectingScp extends Scp {
   constructor(socket, opts) {
@@ -320,6 +326,66 @@ class AbortingScp extends Scp {
   }
   abort(source, reason) {
     this.abortion.setAbortion(true);
+  }
+  associationReleaseRequested() {
+    this.sendAssociationReleaseResponse();
+  }
+}
+
+class StreamingScp extends Scp {
+  constructor(socket, opts) {
+    super(socket, opts);
+    this.association = undefined;
+  }
+  createStoreWritableStream(acceptedPresentationContext, request) {
+    return fs.createWriteStream(StreamingTempFile, { highWaterMark: 1024 });
+  }
+  createDatasetFromStoreWritableStream(writable, acceptedPresentationContext, callback) {
+    writable.on('finish', () => {
+      const datasetBuffer = fs.readFileSync(StreamingTempFile);
+      const dataset = new Dataset(
+        datasetBuffer,
+        acceptedPresentationContext.getAcceptedTransferSyntaxUid()
+      );
+      callback(dataset);
+    });
+    writable.on('error', (err) => {
+      callback(undefined);
+    });
+  }
+  associationRequested(association) {
+    this.association = association;
+    const contexts = association.getPresentationContexts();
+    contexts.forEach((c) => {
+      const context = association.getPresentationContext(c.id);
+      if (
+        context.getAbstractSyntaxUid() === SopClass.StudyRootQueryRetrieveInformationModelGet ||
+        context.getAbstractSyntaxUid() === StorageClass.MrImageStorage
+      ) {
+        context.setResult(PresentationContextResult.Accept, TransferSyntax.ImplicitVRLittleEndian);
+      } else {
+        context.setResult(PresentationContextResult.RejectAbstractSyntaxNotSupported);
+      }
+    });
+    this.sendAssociationAccept();
+  }
+  cGetRequest(request, callback) {
+    const dataset = Dataset.fromFile(StreamingPart10File);
+    const cStoreRequest = new CStoreRequest(dataset);
+    this.sendRequests(cStoreRequest);
+
+    const response = CGetResponse.fromRequest(request);
+    response.setStatus(Status.Success);
+    callback(response);
+  }
+  cStoreRequest(request, callback) {
+    const response = CStoreResponse.fromRequest(request);
+    response.setStatus(Status.Success);
+
+    const dataset = request.getDataset();
+    dataset.toFile(StreamingPart10File);
+
+    callback(response);
   }
   associationReleaseRequested() {
     this.sendAssociationReleaseResponse();
@@ -728,5 +794,67 @@ describe('Network', () => {
     http.get('http://localhost:2113').on('error', () => {
       expect(error).to.be.true;
     });
+  });
+
+  it('should correctly perform and serve a C-STORE operation [streaming]', (done) => {
+    mockFs();
+
+    const server = new Server(StreamingScp);
+    server.on('networkError', (e) => {
+      throw e;
+    });
+    server.listen(2109);
+
+    let ret = undefined;
+    const studyInstanceUid = Dataset.generateDerivedUid();
+    const width = 1024;
+    const height = 1024;
+    const numberOfFrames = 15;
+    const randomPixels = crypto.randomBytes(numberOfFrames * width * height);
+    const dataset = new Dataset(
+      {
+        _vrMap: {
+          PixelData: 'OB',
+        },
+        SOPClassUID: StorageClass.MrImageStorage,
+        StudyInstanceUID: studyInstanceUid,
+        Rows: height,
+        Columns: width,
+        NumberOfFrames: numberOfFrames,
+        BitsStored: 8,
+        BitsAllocated: 8,
+        SamplesPerPixel: 1,
+        PixelRepresentation: 0,
+        PhotometricInterpretation: 'MONOCHROME2',
+        PixelData: [randomPixels.buffer],
+      },
+      TransferSyntax.ExplicitVRLittleEndian
+    );
+
+    const client = new Client();
+    const storeRequest = new CStoreRequest(dataset);
+    client.addRequest(storeRequest);
+    const getRequest = CGetRequest.createStudyGetRequest(studyInstanceUid);
+    client.addRequest(getRequest);
+    client.on('cStoreRequest', (request, callback) => {
+      ret = request.getDataset();
+      const response = CStoreResponse.fromRequest(request);
+      response.setStatus(Status.Success);
+      callback(response);
+    });
+    client.on('closed', () => {
+      expect(new Uint8Array(ret.getElement('PixelData')[0])).to.deep.equal(
+        new Uint8Array(dataset.getElement('PixelData')[0])
+      );
+      server.close();
+      log.info(`Client stats: ${client.getStatistics().toString()}`);
+      log.info(`Server stats: ${server.getStatistics().toString()}`);
+      mockFs.restore();
+      done();
+    });
+    client.on('networkError', (e) => {
+      throw e;
+    });
+    client.send('127.0.0.1', 2109, 'CALLINGAET', 'CALLEDAET');
   });
 });

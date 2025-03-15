@@ -242,10 +242,11 @@ class Network extends AsyncEventEmitter {
    * could cause out of memory situations.
    * @method
    * @param {PresentationContext} acceptedPresentationContext - The accepted presentation context.
+   * @param {CStoreRequest} request - C-STORE request.
    * @returns {Writable} The created store writable stream.
    */
   // eslint-disable-next-line no-unused-vars
-  createStoreWritableStream(acceptedPresentationContext) {
+  createStoreWritableStream(acceptedPresentationContext, request) {
     return MemoryStream.createWriteStream();
   }
 
@@ -436,7 +437,7 @@ class Network extends AsyncEventEmitter {
    * @param {Buffer} data - Accumulated PDU data.
    * @throws Error in case of an unknown PDU type.
    */
-  _processPdu(data) {
+  async _processPdu(data) {
     const raw = new RawPdu(data);
 
     try {
@@ -474,7 +475,7 @@ class Network extends AsyncEventEmitter {
         case RawPduType.PDataTF: {
           const pdu = new PDataTF();
           pdu.read(raw);
-          this._processPDataTf(pdu);
+          await this._processPDataTf(pdu);
           break;
         }
         case RawPduType.AReleaseRQ: {
@@ -520,10 +521,12 @@ class Network extends AsyncEventEmitter {
    * @private
    * @param {PDataTF} pdu - PDU.
    */
-  _processPDataTf(pdu) {
+  async _processPDataTf(pdu) {
     try {
+      let drainPromise = undefined;
       const pdvs = pdu.getPdvs();
-      pdvs.forEach((pdv) => {
+      for (let i = 0; i < pdvs.length; i++) {
+        const pdv = pdvs[i];
         const presentationContext = this.association.getPresentationContext(
           pdv.getPresentationContextId()
         );
@@ -543,6 +546,7 @@ class Network extends AsyncEventEmitter {
                 presentationContext,
                 this.dimse
               );
+              drainPromise = new Promise((resolve) => this.dimseStoreStream.once('drain', resolve));
             }
           } else {
             if (!this.dimseStream) {
@@ -553,9 +557,9 @@ class Network extends AsyncEventEmitter {
         }
 
         const stream = this.dimseStream || this.dimseStoreStream;
-
-        // TODO: Add stream backpressure event handling
-        stream.write(pdv.getValue());
+        if (!stream.write(pdv.getValue()) && drainPromise) {
+          await drainPromise;
+        }
 
         if (pdv.isLastFragment()) {
           if (pdv.isCommand()) {
@@ -679,7 +683,7 @@ class Network extends AsyncEventEmitter {
             }
           }
         }
-      });
+      }
     } catch (err) {
       log.error(`${this.logId} -> Error reading DIMSE: ${err.message}`);
       this.emit('networkError', err);
@@ -779,9 +783,9 @@ class Network extends AsyncEventEmitter {
       this.emit('connect');
     });
     const pduAccumulator = new PduAccumulator();
-    pduAccumulator.on('pdu', (data) => {
+    pduAccumulator.on('pdu', async (data) => {
       this.lastPduTime = Date.now();
-      this._processPdu(data);
+      await this._processPdu(data);
     });
     pduAccumulator.on('error', (err) => {
       this._reset();
