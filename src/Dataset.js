@@ -31,6 +31,7 @@ class Dataset {
         this.transferSyntaxUid,
         readOptions
       );
+      this.buffer = elementsOrBuffer;
       return;
     }
 
@@ -205,6 +206,45 @@ class Dataset {
       });
     } else {
       writeFileSync(path, Buffer.from(dicomDict.write(writeOptions)));
+    }
+  }
+
+  /**
+   * Saves a dataset to DICOM P10 file using the raw element buffer, bypassing
+   * naturalization/denaturalization. Preserves the original encoded elements exactly.
+   * @method
+   * @param {string} path - P10 file path.
+   * @param {function(Error)} [callback] - P10 file writing callback function.
+   * If this is not provided, the function runs synchronously.
+   */
+  toFileRaw(path, callback) {
+    if (!this.buffer) {
+      throw new Error('No raw buffer available. Dataset was not created from a buffer.');
+    }
+
+    const metaElements = {
+      FileMetaInformationVersion: new Uint8Array([0, 1]).buffer,
+      MediaStorageSOPClassUID:
+        this.getElement('SOPClassUID') || StorageClass.SecondaryCaptureImageStorage,
+      MediaStorageSOPInstanceUID:
+        this.getElement('SOPInstanceUID') || Dataset.generateDerivedUid(),
+      TransferSyntaxUID: this.getTransferSyntaxUid(),
+      ImplementationClassUID: Implementation.getImplementationClassUid(),
+      ImplementationVersionName: Implementation.getImplementationVersion(),
+    };
+
+    const denaturalizedMetaHeader = DicomMetaDictionary.denaturalizeDataset(metaElements);
+    const dicomDict = new DicomDict(denaturalizedMetaHeader);
+    dicomDict.dict = {};
+
+    const fileBuffer = Buffer.concat([Buffer.from(dicomDict.write()), this.buffer]);
+
+    if (callback instanceof Function) {
+      writeFile(path, fileBuffer, (error) => {
+        callback(error ? error : undefined);
+      });
+    } else {
+      writeFileSync(path, fileBuffer);
     }
   }
 

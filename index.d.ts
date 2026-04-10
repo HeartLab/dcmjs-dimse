@@ -257,6 +257,12 @@ declare class Dataset {
     writeOptions?: Record<string, unknown>
   ): void;
 
+   /**
+   * Saves a dataset to DICOM P10 file using the raw element buffer, bypassing
+   * naturalization/denaturalization. Preserves the original encoded elements exactly.
+   */
+  toFileRaw(path: string, callback?: (error: Error | undefined) => void): void;
+
   /**
    * Generates a UUID-derived UID.
    */
