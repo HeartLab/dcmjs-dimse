@@ -36,6 +36,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const mockFs = require('mock-fs');
 const chai = require('chai');
+const { Writable } = require('stream');
 const expect = chai.expect;
 
 const datasets = [
@@ -385,6 +386,83 @@ class StreamingScp extends Scp {
     const dataset = request.getDataset();
     dataset.toFile(StreamingPart10File);
 
+    callback(response);
+  }
+  associationReleaseRequested() {
+    this.sendAssociationReleaseResponse();
+  }
+}
+
+// Slow writable used to exercise backpressure on the C-STORE streaming path.
+class SlowWritable extends Writable {
+  constructor({ highWaterMark, writeDelayMs }) {
+    super({ highWaterMark });
+    this.chunks = [];
+    this.samples = [];
+    this.writeDelayMs = writeDelayMs;
+  }
+  _write(chunk, _encoding, callback) {
+    this.chunks.push(chunk);
+    this.samples.push(this.writableLength);
+    setTimeout(callback, this.writeDelayMs);
+  }
+  toBuffer() {
+    return Buffer.concat(this.chunks);
+  }
+}
+
+class BackpressureScp extends Scp {
+  constructor(socket, opts) {
+    super(socket, opts);
+    this.association = undefined;
+
+    BackpressureScp.lastSocket = socket;
+    BackpressureScp.pauseCount = 0;
+    BackpressureScp.resumeCount = 0;
+    const origPause = socket.pause.bind(socket);
+    const origResume = socket.resume.bind(socket);
+    socket.pause = (...args) => {
+      BackpressureScp.pauseCount++;
+      return origPause(...args);
+    };
+    socket.resume = (...args) => {
+      BackpressureScp.resumeCount++;
+      return origResume(...args);
+    };
+  }
+  createStoreWritableStream(acceptedPresentationContext, request) {
+    BackpressureScp.lastWritable = new SlowWritable({
+      highWaterMark: 64 * 1024,
+      writeDelayMs: 10,
+    });
+    return BackpressureScp.lastWritable;
+  }
+  createDatasetFromStoreWritableStream(writable, acceptedPresentationContext, callback) {
+    writable.on('finish', () => {
+      const dataset = new Dataset(
+        writable.toBuffer(),
+        acceptedPresentationContext.getAcceptedTransferSyntaxUid()
+      );
+      callback(dataset);
+    });
+    writable.on('error', () => callback(undefined));
+  }
+  associationRequested(association) {
+    this.association = association;
+    const contexts = association.getPresentationContexts();
+    contexts.forEach((c) => {
+      const context = association.getPresentationContext(c.id);
+      if (context.getAbstractSyntaxUid() === StorageClass.MrImageStorage) {
+        context.setResult(PresentationContextResult.Accept, TransferSyntax.ExplicitVRLittleEndian);
+      } else {
+        context.setResult(PresentationContextResult.RejectAbstractSyntaxNotSupported);
+      }
+    });
+    this.sendAssociationAccept();
+  }
+  cStoreRequest(request, callback) {
+    const response = CStoreResponse.fromRequest(request);
+    response.setStatus(Status.Success);
     callback(response);
   }
   associationReleaseRequested() {
@@ -856,5 +934,64 @@ describe('Network', () => {
       throw e;
     });
     client.send('127.0.0.1', 2109, 'CALLINGAET', 'CALLEDAET');
+  });
+
+  it('should honour backpressure when writing C-STORE PDVs to a slow writable', (done) => {
+    const server = new Server(BackpressureScp);
+    server.on('networkError', (e) => {
+      throw e;
+    });
+    server.listen(2114);
+
+    const studyInstanceUid = Dataset.generateDerivedUid();
+    const width = 512;
+    const height = 512;
+    const numberOfFrames = 16;
+    // ~4 MB pixel payload, roughly 16 PDVs at the default 256 KB max PDU.
+    const randomPixels = crypto.randomBytes(numberOfFrames * width * height);
+    const dataset = new Dataset(
+      {
+        _vrMap: { PixelData: 'OB' },
+        SOPClassUID: StorageClass.MrImageStorage,
+        StudyInstanceUID: studyInstanceUid,
+        Rows: height,
+        Columns: width,
+        NumberOfFrames: numberOfFrames,
+        BitsStored: 8,
+        BitsAllocated: 8,
+        SamplesPerPixel: 1,
+        PixelRepresentation: 0,
+        PhotometricInterpretation: 'MONOCHROME2',
+        PixelData: [randomPixels.buffer],
+      },
+      TransferSyntax.ExplicitVRLittleEndian
+    );
+
+    const client = new Client();
+    const storeRequest = new CStoreRequest(dataset);
+    client.addRequest(storeRequest);
+    client.on('closed', () => {
+      const w = BackpressureScp.lastWritable;
+      try {
+        expect(w, 'BackpressureScp createStoreWritableStream should have run').to.exist;
+        const peak = Math.max(0, ...w.samples);
+        expect(peak, `writableLength peaked at ${peak} bytes`).to.be.lessThan(1 * 1024 * 1024);
+        expect(
+          BackpressureScp.pauseCount,
+          'socket.pause() should have been called when the writable backpressured'
+        ).to.be.greaterThan(0);
+        expect(
+          BackpressureScp.resumeCount,
+          'every socket.pause() must be balanced by a socket.resume()'
+        ).to.be.eq(BackpressureScp.pauseCount);
+        server.close();
+        done();
+      } catch (err) {
+        server.close();
+        done(err);
+      }
+    });
+    client.on('networkError', (e) => done(e));
+    client.send('127.0.0.1', 2114, 'CALLINGAET', 'CALLEDAET');
   });
 });

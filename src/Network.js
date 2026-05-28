@@ -523,7 +523,6 @@ class Network extends AsyncEventEmitter {
    */
   async _processPDataTf(pdu) {
     try {
-      let drainPromise = undefined;
       const pdvs = pdu.getPdvs();
       for (let i = 0; i < pdvs.length; i++) {
         const pdv = pdvs[i];
@@ -546,7 +545,6 @@ class Network extends AsyncEventEmitter {
                 presentationContext,
                 this.dimse
               );
-              drainPromise = new Promise((resolve) => this.dimseStoreStream.once('drain', resolve));
             }
           } else {
             if (!this.dimseStream) {
@@ -557,8 +555,15 @@ class Network extends AsyncEventEmitter {
         }
 
         const stream = this.dimseStream || this.dimseStoreStream;
-        if (!stream.write(pdv.getValue()) && drainPromise) {
-          await drainPromise;
+        if (!stream.write(pdv.getValue())) {
+          // Pause the socket so the TCP window closes the sender; otherwise
+          // PDVs keep queueing in front of the slow writable while we wait.
+          this.socket.pause();
+          try {
+            await this._waitForDrain(stream);
+          } finally {
+            this.socket.resume();
+          }
         }
 
         if (pdv.isLastFragment()) {
@@ -691,6 +696,42 @@ class Network extends AsyncEventEmitter {
   }
 
   /**
+   * Waits for a Writable to emit 'drain'.
+   * Resolves on 'drain' or 'close' and rejects on 'error'.
+   * @method
+   * @private
+   * @param {Writable} stream - The writable stream to wait on.
+   * @returns {Promise<void>}
+   */
+  _waitForDrain(stream) {
+    if (stream.writableNeedDrain === false) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve, reject) => {
+      const cleanup = () => {
+        stream.off('drain', onDrain);
+        stream.off('error', onError);
+        stream.off('close', onClose);
+      };
+      const onDrain = () => {
+        cleanup();
+        resolve();
+      };
+      const onError = (err) => {
+        cleanup();
+        reject(err);
+      };
+      const onClose = () => {
+        cleanup();
+        resolve();
+      };
+      stream.once('drain', onDrain);
+      stream.once('error', onError);
+      stream.once('close', onClose);
+    });
+  }
+
+  /**
    * Perform DIMSE operation.
    * @method
    * @private
@@ -783,9 +824,19 @@ class Network extends AsyncEventEmitter {
       this.emit('connect');
     });
     const pduAccumulator = new PduAccumulator();
-    pduAccumulator.on('pdu', async (data) => {
-      this.lastPduTime = Date.now();
-      await this._processPdu(data);
+    // Serialize PDU processing so the per-write drain await in _processPDataTf
+    // isn't bypassed by concurrent _processPdu invocations from the same read.
+    let pduTail = Promise.resolve();
+    pduAccumulator.on('pdu', (data) => {
+      pduTail = pduTail.then(async () => {
+        this.lastPduTime = Date.now();
+        await this._processPdu(data);
+      });
+      // Keep the chain advancing on rejection; _processPdu already routes
+      // internal errors to 'networkError'.
+      pduTail.catch((err) => {
+        log.error(`${this.logId} -> Unhandled error processing PDU: ${err.message}`);
+      });
     });
     pduAccumulator.on('error', (err) => {
       this._reset();
