@@ -50,6 +50,7 @@ const log = require('./log');
 
 const { SmartBuffer } = require('smart-buffer');
 const { EOL } = require('os');
+const { Writable, pipeline } = require('stream');
 const AsyncEventEmitter = require('async-eventemitter');
 const MemoryStream = require('memorystream');
 
@@ -78,6 +79,8 @@ class Network extends AsyncEventEmitter {
 
     this.dimseStream = undefined;
     this.dimseStoreStream = undefined;
+    this.dimseStoreStreamError = undefined;
+    this._storeStreamErrorHandler = undefined;
     this.dimse = undefined;
 
     opts = opts || {};
@@ -93,6 +96,10 @@ class Network extends AsyncEventEmitter {
     this.connected = false;
     this.connectedTime = undefined;
     this.lastPduTime = undefined;
+    // True while we've stopped reading the socket because we're blocked on our
+    // own store consumer (write backpressure or upload finalization). Peer silence
+    // during this window is self-induced, so the pduTimeout must not count it.
+    this.consumerBlocked = false;
     this.timeoutIntervalId = undefined;
     this.statistics = new Statistics();
 
@@ -256,10 +263,13 @@ class Network extends AsyncEventEmitter {
    * Scp.cStoreRequest method for processing.
    * @method
    * @param {Writable} writable - The store writable stream.
+   * @param {CStoreRequest} request - The C-STORE request the dataset belongs to. The same
+   * request instance is passed to createStoreWritableStream, so it can be used as a key to
+   * correlate the two (e.g. to await an upload started when the stream was created).
    * @param {PresentationContext} acceptedPresentationContext - The accepted presentation context.
    * @param {function(Dataset)} callback - Created dataset callback function.
    */
-  createDatasetFromStoreWritableStream(writable, acceptedPresentationContext, callback) {
+  createDatasetFromStoreWritableStream(writable, request, acceptedPresentationContext, callback) {
     const dataset = new Dataset(
       writable.toBuffer(),
       acceptedPresentationContext.getAcceptedTransferSyntaxUid()
@@ -530,6 +540,11 @@ class Network extends AsyncEventEmitter {
           pdv.getPresentationContextId()
         );
 
+        // Drop orphaned data fragments (e.g. left over from an aborted transfer)
+        if (!this.dimse && !pdv.isCommand()) {
+          continue;
+        }
+
         if (!this.dimse) {
           // Create stream to receive command
           if (!this.dimseStream) {
@@ -545,6 +560,13 @@ class Network extends AsyncEventEmitter {
                 presentationContext,
                 this.dimse
               );
+              // Capture a store stream error during the write phase so it routes
+              // through the catch below instead of crashing on an unhandled 'error'
+              this.dimseStoreStreamError = undefined;
+              this._storeStreamErrorHandler = (err) => {
+                this.dimseStoreStreamError = err;
+              };
+              this.dimseStoreStream.once('error', this._storeStreamErrorHandler);
             }
           } else {
             if (!this.dimseStream) {
@@ -555,15 +577,11 @@ class Network extends AsyncEventEmitter {
         }
 
         const stream = this.dimseStream || this.dimseStoreStream;
+        if (this.dimseStoreStreamError) {
+          throw this.dimseStoreStreamError;
+        }
         if (!stream.write(pdv.getValue())) {
-          // Pause the socket so the TCP window closes the sender; otherwise
-          // PDVs keep queueing in front of the slow writable while we wait.
-          this.socket.pause();
-          try {
-            await this._waitForDrain(stream);
-          } finally {
-            this.socket.resume();
-          }
+          await this._whileBlockedOnConsumer(() => this._waitForDrain(stream));
         }
 
         if (pdv.isLastFragment()) {
@@ -661,17 +679,56 @@ class Network extends AsyncEventEmitter {
             this.dimseStoreStream = undefined;
           } else {
             if (this.dimse.getCommandFieldType() === CommandFieldType.CStoreRequest) {
-              this.dimseStoreStream.end();
-              this.createDatasetFromStoreWritableStream(
-                this.dimseStoreStream,
-                presentationContext,
-                (dataset) => {
-                  this.dimse.setDataset(dataset);
-                  this._performDimse(presentationContext, this.dimse);
-                  this.dimseStream = undefined;
-                  this.dimseStoreStream = undefined;
-                  this.dimse = undefined;
-                }
+              const storeStream = this.dimseStoreStream;
+              // Hand the write-phase guard off to the promise's own listeners
+              if (this._storeStreamErrorHandler) {
+                storeStream.off('error', this._storeStreamErrorHandler);
+                this._storeStreamErrorHandler = undefined;
+              }
+              storeStream.end();
+              // Resolve when the dataset is built; reject on stream error/early
+              // close so a stalled createDatasetFromStoreWritableStream can't hang.
+              // Finalizing a large upload can take far longer than pduTimeout while
+              // the peer sits idle waiting for our C-STORE-RSP, so run it blocked.
+              await this._whileBlockedOnConsumer(
+                () =>
+                  new Promise((resolve, reject) => {
+                    const onError = (error) => {
+                      cleanup();
+                      reject(error);
+                    };
+                    const onClose = () => {
+                      if (!storeStream.writableFinished) {
+                        cleanup();
+                        reject(new Error('Store stream closed before dataset creation completed'));
+                      }
+                    };
+                    const cleanup = () => {
+                      storeStream.off('error', onError);
+                      storeStream.off('close', onClose);
+                    };
+                    storeStream.on('error', onError);
+                    storeStream.on('close', onClose);
+                    this.createDatasetFromStoreWritableStream(
+                      storeStream,
+                      this.dimse,
+                      presentationContext,
+                      (dataset) => {
+                        cleanup();
+                        this.dimse.setDataset(dataset);
+                        // Everything up to here ran in the suspended window. _performDimse
+                        // hands off to the SCP request handler and we resolve() below, so
+                        // from this point the peer-silence timers are live again: a handler
+                        // that stalls before responding can still trip the pduTimeout.
+                        // Long-running, pre-response work belongs above, before callback().
+                        this._performDimse(presentationContext, this.dimse);
+                        this.dimseStream = undefined;
+                        this.dimseStoreStream = undefined;
+                        this.dimse = undefined;
+                        resolve();
+                      }
+                    );
+                  })
               );
             } else {
               this.dimseStream.end();
@@ -691,7 +748,46 @@ class Network extends AsyncEventEmitter {
       }
     } catch (err) {
       log.error(`${this.logId} -> Error reading DIMSE: ${err.message}`);
+      // Abandon the failed transfer so it can't bleed into the next one
+      this._destroyDimseStream(this.dimseStoreStream, err);
+      this.dimseStream = undefined;
+      this.dimseStoreStream = undefined;
+      this.dimseStoreStreamError = undefined;
+      this._storeStreamErrorHandler = undefined;
+      this.dimse = undefined;
       this.emit('networkError', err);
+    }
+  }
+
+  /**
+   * Runs an operation during which we've stopped reading the socket because we're
+   * blocked on our own store consumer (write backpressure or upload finalization).
+   * Suspends both liveness timers for its duration — our pduTimeout check and the
+   * socket's own idle timeout — so a slow-but-alive consumer isn't mistaken for a
+   * silent peer, and restarts the peer-silence clock on resume so a long block
+   * doesn't trip the timeout the instant we start listening again.
+   * A genuinely wedged consumer is still caught by its own error/close (which reject
+   * these awaits) — the store writable is responsible for its own inactivity timeout.
+   * @method
+   * @private
+   * @param {function(): Promise<*>} fn - The consumer-bound operation to await.
+   * @returns {Promise<*>}
+   */
+  async _whileBlockedOnConsumer(fn) {
+    this.consumerBlocked = true;
+    // Stand the socket's idle timeout down too: while blocked we're deliberately
+    // not doing socket I/O, which Node would otherwise count as an idle connection.
+    if (this.socket && !this.socket.destroyed) {
+      this.socket.setTimeout(0);
+    }
+    try {
+      return await fn();
+    } finally {
+      this.consumerBlocked = false;
+      this.lastPduTime = Date.now();
+      if (this.socket && !this.socket.destroyed) {
+        this.socket.setTimeout(this.connectTimeout);
+      }
     }
   }
 
@@ -729,6 +825,22 @@ class Network extends AsyncEventEmitter {
       stream.once('error', onError);
       stream.once('close', onClose);
     });
+  }
+
+  /**
+   * Destroys an in-flight DIMSE writable stream, ensuring an 'error' listener is
+   * attached first so destroy(err) re-emitting the error can't crash the process.
+   * @method
+   * @private
+   * @param {Writable} [stream] - The DIMSE writable stream to destroy.
+   * @param {Error} [err] - The teardown error, if any.
+   */
+  _destroyDimseStream(stream, err) {
+    if (!stream || stream.destroyed) {
+      return;
+    }
+    stream.once('error', () => {});
+    stream.destroy(err || undefined);
   }
 
   /**
@@ -823,45 +935,58 @@ class Network extends AsyncEventEmitter {
       this.connectedTime = Date.now();
       this.emit('connect');
     });
-    const pduAccumulator = new PduAccumulator();
-    // Serialize PDU processing so the per-write drain await in _processPDataTf
-    // isn't bypassed by concurrent _processPdu invocations from the same read.
-    let pduTail = Promise.resolve();
-    pduAccumulator.on('pdu', (data) => {
-      pduTail = pduTail.then(async () => {
-        this.lastPduTime = Date.now();
-        await this._processPdu(data);
-      });
-      // Keep the chain advancing on rejection; _processPdu already routes
-      // internal errors to 'networkError'.
-      pduTail.catch((err) => {
-        log.error(`${this.logId} -> Unhandled error processing PDU: ${err.message}`);
-      });
-    });
-    pduAccumulator.on('error', (err) => {
-      this._reset();
-      const error = `${this.logId} -> Connection error: ${err.message}`;
-      log.error(error);
-      this.emit('networkError', new Error(error));
-    });
-    this.socket.on('data', (data) => {
-      pduAccumulator.accumulate(data);
-      this.statistics.addBytesReceived(data.length);
-    });
-    this.socket.on('error', (err) => {
-      this._reset();
-      const error = `${this.logId} -> Connection error: ${err.message}`;
-      log.error(error);
-      this.emit('networkError', new Error(error));
-    });
     this.socket.on('timeout', () => {
       this._reset();
       const error = `${this.logId} -> Connection timeout`;
       log.error(error);
       this.emit('networkError', new Error(error));
     });
-    this.socket.on('close', () => {
+
+    // Consume socket bytes through a single Writable and await each PDU. Delaying
+    // cb() while _processPdu awaits drain on the store writable fills this queue,
+    // so the pipe pauses the socket and backpressure reaches the TCP window.
+    const accumulator = new PduAccumulator();
+    const consumer = new Writable({
+      write: (chunk, _enc, cb) => {
+        // Stamp on inbound activity so pduTimeout measures peer silence, not the
+        // time to stream in a single large PDU
+        this.lastPduTime = Date.now();
+        this.statistics.addBytesReceived(chunk.length);
+        let pdus;
+        try {
+          pdus = accumulator.consume(chunk);
+        } catch (err) {
+          return cb(err);
+        }
+        const next = (i) => {
+          if (i >= pdus.length) {
+            return cb();
+          }
+          this._processPdu(pdus[i]).then(() => next(i + 1), cb);
+        };
+        next(0);
+      },
+    });
+
+    pipeline(this.socket, consumer, (err) => {
+      // A local teardown (e.g. Server.close()) surfaces as ERR_STREAM_PREMATURE_CLOSE,
+      // which is a clean close; a remote failure carries its own code (ECONNRESET, etc.)
+      if (err && err.code === 'ERR_STREAM_PREMATURE_CLOSE') {
+        err = undefined;
+      }
+
+      // Tear down any in-flight DIMSE writable so downstream consumers don't hang
+      this._destroyDimseStream(this.dimseStoreStream, err);
+      this._destroyDimseStream(this.dimseStream, err);
+      this.dimseStoreStream = undefined;
+      this.dimseStream = undefined;
+
       this._reset();
+      if (err) {
+        const error = `${this.logId} -> Connection error: ${err.message}`;
+        log.error(error);
+        this.emit('networkError', new Error(error));
+      }
       log.info(`${this.logId} -> Connection closed`);
       this.emit('close');
     });
@@ -880,6 +1005,7 @@ class Network extends AsyncEventEmitter {
       } else if (
         this.connected &&
         this.lastPduTime &&
+        !this.consumerBlocked &&
         current - this.lastPduTime >= this.pduTimeout
       ) {
         error = `${this.logId} -> Exceeded PDU timeout (${this.pduTimeout}), closing connection...`;
@@ -887,6 +1013,15 @@ class Network extends AsyncEventEmitter {
       }
       if (timedOut) {
         this.sendAbort();
+        // This only fires when we're not blocked on our own consumer (see the
+        // !consumerBlocked guard above), so it's a genuinely idle or dead peer.
+        // Destroy any half-received store stream and the socket rather than waiting
+        // on the peer to close it.
+        this._destroyDimseStream(this.dimseStoreStream);
+        this._destroyDimseStream(this.dimseStream);
+        this.dimseStoreStream = undefined;
+        this.dimseStream = undefined;
+        this.socket.destroy();
         this._reset();
         log.error(error);
         this.emit('networkError', new Error(`Connection timeout: ${error}`));
@@ -902,6 +1037,7 @@ class Network extends AsyncEventEmitter {
   _reset() {
     this.connected = false;
     this.lastPduTime = undefined;
+    this.consumerBlocked = false;
     this.connectedTime = undefined;
     if (this.timeoutIntervalId) {
       clearInterval(this.timeoutIntervalId);
@@ -913,35 +1049,37 @@ class Network extends AsyncEventEmitter {
 //#endregion
 
 //#region PduAccumulator
-class PduAccumulator extends AsyncEventEmitter {
+/**
+ * Stateful byte-to-PDU parser. Keeps the partial-frame buffer between calls so
+ * the surrounding Writable can drive backpressure (no events, no IO).
+ */
+class PduAccumulator {
   /**
-   * Creates an instance of PduAccumulator.
-   * @constructor
-   */
-  constructor() {
-    super();
-  }
-
-  /**
-   * Accumulates the received data from the network.
+   * Consumes a socket chunk and returns any complete PDUs it can frame.
    * @method
-   * @param {Buffer} data - The received data.
+   * @param {Buffer} chunk - Bytes received from the socket.
+   * @returns {Array<Buffer>} Zero or more complete PDU buffers.
+   * @throws Error in case of an unknown PDU type.
    */
-  accumulate(data) {
-    do {
-      data = this._process(data);
-    } while (data !== undefined);
+  consume(chunk) {
+    const pdus = [];
+    let data = chunk;
+    while (data !== undefined) {
+      data = this._process(data, pdus);
+    }
+    return pdus;
   }
 
   //#region Private Methods
   /**
-   * Processes the received data until a full PDU is received.
+   * Frames a single PDU from the received data, buffering any partial frame.
    * @method
    * @private
    * @param {Buffer} data - The received data from the network.
-   * @returns {number|undefined} The remaining bytes for a full PDU or undefined.
+   * @param {Array<Buffer>} pdus - Accumulator for complete PDU buffers.
+   * @returns {Buffer|undefined} The remaining bytes after a full PDU, or undefined.
    */
-  _process(data) {
+  _process(data, pdus) {
     if (this.receiving === undefined) {
       if (this.minimumReceived) {
         data = Buffer.concat(
@@ -966,9 +1104,7 @@ class PduAccumulator extends AsyncEventEmitter {
         pduType !== RawPduType.AReleaseRP &&
         pduType !== RawPduType.AAbort
       ) {
-        this.emit('error', new Error(`Unknown PDU type: ${pduType}`));
-
-        return undefined;
+        throw new Error(`Unknown PDU type: ${pduType}`);
       }
 
       buffer.readUInt8();
@@ -989,7 +1125,7 @@ class PduAccumulator extends AsyncEventEmitter {
 
         this.receiving = undefined;
         this.receivedLength = undefined;
-        this.emit('pdu', pduData);
+        pdus.push(pduData);
 
         if (remaining) {
           return remaining;
@@ -1010,7 +1146,7 @@ class PduAccumulator extends AsyncEventEmitter {
 
         this.receiving = undefined;
         this.receivedLength = undefined;
-        this.emit('pdu', newPduData);
+        pdus.push(newPduData);
 
         if (remaining) {
           return remaining;

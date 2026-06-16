@@ -1483,6 +1483,7 @@ declare class Scp extends Network {
    */
   createDatasetFromStoreWritableStream(
     writable: Writable,
+    request: CStoreRequest,
     acceptedPresentationContext: PresentationContext,
     callback: (dataset: Dataset) => void
   ): void;

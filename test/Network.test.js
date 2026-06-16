@@ -341,7 +341,7 @@ class StreamingScp extends Scp {
   createStoreWritableStream(acceptedPresentationContext, request) {
     return fs.createWriteStream(StreamingTempFile, { highWaterMark: 1024 });
   }
-  createDatasetFromStoreWritableStream(writable, acceptedPresentationContext, callback) {
+  createDatasetFromStoreWritableStream(writable, request, acceptedPresentationContext, callback) {
     writable.on('finish', () => {
       const datasetBuffer = fs.readFileSync(StreamingTempFile);
       const dataset = new Dataset(
@@ -437,7 +437,7 @@ class BackpressureScp extends Scp {
     });
     return BackpressureScp.lastWritable;
   }
-  createDatasetFromStoreWritableStream(writable, acceptedPresentationContext, callback) {
+  createDatasetFromStoreWritableStream(writable, request, acceptedPresentationContext, callback) {
     writable.on('finish', () => {
       const dataset = new Dataset(
         writable.toBuffer(),
@@ -469,6 +469,44 @@ class BackpressureScp extends Scp {
     this.sendAssociationReleaseResponse();
   }
 }
+
+// Delays the createDatasetFromStoreWritableStream callback well beyond the
+// configured pduTimeout, standing in for a long-running store consumer such as an
+// S3 multipart upload committing. The finalization runs inside the suspended
+// window, so the PDU timeout must not fire and the C-STORE must complete.
+class SlowFinalizeScp extends Scp {
+  constructor(socket, opts) {
+    super(socket, opts);
+    this.association = undefined;
+  }
+  createDatasetFromStoreWritableStream(writable, request, acceptedPresentationContext, callback) {
+    setTimeout(() => {
+      callback(new Dataset({}, acceptedPresentationContext.getAcceptedTransferSyntaxUid()));
+    }, SlowFinalizeScp.finalizeDelayMs);
+  }
+  associationRequested(association) {
+    this.association = association;
+    const contexts = association.getPresentationContexts();
+    contexts.forEach((c) => {
+      const context = association.getPresentationContext(c.id);
+      if (context.getAbstractSyntaxUid() === StorageClass.MrImageStorage) {
+        context.setResult(PresentationContextResult.Accept, TransferSyntax.ExplicitVRLittleEndian);
+      } else {
+        context.setResult(PresentationContextResult.RejectAbstractSyntaxNotSupported);
+      }
+    });
+    this.sendAssociationAccept();
+  }
+  cStoreRequest(request, callback) {
+    const response = CStoreResponse.fromRequest(request);
+    response.setStatus(Status.Success);
+    callback(response);
+  }
+  associationReleaseRequested() {
+    this.sendAssociationReleaseResponse();
+  }
+}
+SlowFinalizeScp.finalizeDelayMs = 2500;
 
 describe('Network', () => {
   before(() => {
@@ -980,10 +1018,12 @@ describe('Network', () => {
           BackpressureScp.pauseCount,
           'socket.pause() should have been called when the writable backpressured'
         ).to.be.greaterThan(0);
+        // pause()/resume() are now driven by stream.pipeline() internally and may
+        // differ by one on teardown (a trailing resume() with no pause())
         expect(
-          BackpressureScp.resumeCount,
-          'every socket.pause() must be balanced by a socket.resume()'
-        ).to.be.eq(BackpressureScp.pauseCount);
+          Math.abs(BackpressureScp.resumeCount - BackpressureScp.pauseCount),
+          'resume() and pause() must stay paired within one of each other'
+        ).to.be.lessThanOrEqual(1);
         server.close();
         done();
       } catch (err) {
@@ -993,5 +1033,53 @@ describe('Network', () => {
     });
     client.on('networkError', (e) => done(e));
     client.send('127.0.0.1', 2114, 'CALLINGAET', 'CALLEDAET');
+  });
+
+  it('should not trip the PDU timeout while a slow store consumer finalizes', function (done) {
+    // Finalization (2500ms) deliberately outlasts pduTimeout (1000ms); without the
+    // finalization-window suspension the association would be aborted mid-commit.
+    this.timeout(10000);
+    SlowFinalizeScp.finalizeDelayMs = 2500;
+
+    const server = new Server(SlowFinalizeScp);
+    let serverError;
+    server.on('networkError', (e) => {
+      serverError = e;
+    });
+    server.listen(2115, { pduTimeout: 1000 });
+
+    let storeStatus;
+    const client = new Client();
+    const storeRequest = new CStoreRequest(
+      new Dataset({
+        SOPClassUID: StorageClass.MrImageStorage,
+        StudyInstanceUID: Dataset.generateDerivedUid(),
+        PatientID: '99999',
+        PatientName: 'SLOW^FINALIZE',
+      })
+    );
+    storeRequest.on('response', (response) => {
+      storeStatus = response.getStatus();
+    });
+    client.addRequest(storeRequest);
+    client.on('networkError', (e) => {
+      server.close();
+      done(e);
+    });
+    client.on('closed', () => {
+      try {
+        expect(serverError, 'server must not raise a PDU timeout during finalization').to.be
+          .undefined;
+        expect(storeStatus, 'C-STORE should succeed despite slow finalization').to.equal(
+          Status.Success
+        );
+        server.close();
+        done();
+      } catch (err) {
+        server.close();
+        done(err);
+      }
+    });
+    client.send('127.0.0.1', 2115, 'CALLINGAET', 'CALLEDAET');
   });
 });

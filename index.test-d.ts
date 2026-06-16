@@ -485,6 +485,7 @@ class TestScp extends Scp {
   }
   createDatasetFromStoreWritableStream(
     writable: Writable,
+    request: requests.CStoreRequest,
     acceptedPresentationContext: association.PresentationContext,
     callback: (dataset: Dataset) => void
   ): void {

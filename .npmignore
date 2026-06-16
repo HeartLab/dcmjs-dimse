@@ -8,6 +8,8 @@ test/
 documentation/
 
 ## Root files
+*.tgz
+.claude/
 .eslintrc.json
 .gitignore
 .jsdocrc.json
